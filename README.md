@@ -1,6 +1,6 @@
 # Web Browser Monitor
 
-A **100% Rust** real-time process, memory, hidden-service, and cross-browser tab monitor for **all major web browsers** — featuring both a colorful **CLI / Terminal TUI** (`web-browser-monitor`) and a GPU-accelerated **GPUI Desktop GUI** (`web-browser-monitor-gui`).
+Web browser monitor tool with a modern UI in Rust — includes both a CLI (`web-browser-monitor`) and a Desktop GUI (`web-browser-monitor-gui`).
 
 > **Platform Support:** Tested on **macOS** (Apple Silicon). Built in cross-platform Rust (`sysinfo`, `crossterm`, `gpui-kit`) and works across **macOS, Linux, and Windows**.
 
