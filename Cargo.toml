@@ -1,0 +1,35 @@
+[workspace]
+
+[package]
+name = "web-browser-monitor"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time multi-browser RAM, CPU, hidden service & event monitor (CLI + GPUI GUI)"
+license = "MIT"
+
+[lib]
+name = "web_browser_monitor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "web-browser-monitor"
+path = "src/bin/web-browser-monitor.rs"
+
+[[bin]]
+name = "web-browser-monitor-gui"
+path = "src/bin/web-browser-monitor-gui.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+gui = ["dep:gpui-kit"]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossterm = "0.28"
+sysinfo = "0.33"
+gpui-kit = { version = "0.10.0", optional = true }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
