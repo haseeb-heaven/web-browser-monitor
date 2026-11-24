@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
@@ -158,12 +158,14 @@ fn active_text_color(theme: ThemeMode, active: bool, p: &ThemePalette) -> u32 {
 struct GuiLaunchArgs {
     theme: ThemeMode,
     tab: ActiveTab,
+    browser: Option<BrowserKind>,
     open_dropdown: OpenDropdown,
 }
 
 fn parse_gui_args() -> GuiLaunchArgs {
     let mut theme = ThemeMode::Dark;
     let mut tab = ActiveTab::Overview;
+    let mut browser = None;
     let mut open_dropdown = OpenDropdown::None;
     let args: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -185,6 +187,12 @@ fn parse_gui_args() -> GuiLaunchArgs {
                     }
                 }
             }
+            "--browser" | "-b" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    browser = BrowserKind::from_str_loose(&args[i]);
+                }
+            }
             "--open-dropdown" => {
                 if i + 1 < args.len() {
                     i += 1;
@@ -197,7 +205,7 @@ fn parse_gui_args() -> GuiLaunchArgs {
             "--help" | "-h" => {
                 println!(
                     "web-browser-monitor-gui — GPUI Multi-Browser, Hidden Service & Tab Transfer Monitor\n\n\
-                     USAGE:\n  web-browser-monitor-gui [--theme dark|light|classic] [--tab overview|browsers|processes|transfer|logs|settings] [--open-dropdown toolbar-browser|toolbar-sort|transfer-source|transfer-target|settings-browser]"
+                     USAGE:\n  web-browser-monitor-gui [--theme dark|light|classic] [--tab overview|browsers|processes|transfer|logs|settings] [--browser <name>] [--open-dropdown toolbar-browser|toolbar-sort|transfer-source|transfer-target|settings-browser]"
                 );
                 std::process::exit(0);
             }
@@ -205,7 +213,12 @@ fn parse_gui_args() -> GuiLaunchArgs {
         }
         i += 1;
     }
-    GuiLaunchArgs { theme, tab, open_dropdown }
+    GuiLaunchArgs {
+        theme,
+        tab,
+        browser,
+        open_dropdown,
+    }
 }
 
 struct BrowserMonitorGui {
@@ -272,8 +285,17 @@ impl BrowserMonitorGui {
 
         let history_capacity = 30;
         let mut history = HistoryBuffer::new(history_capacity);
-        let ram_mb = processes.iter().map(|p| p.memory_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
-        let cpu_pct = processes.iter().map(|p| p.cpu_usage).sum::<f32>();
+        let ram_mb = processes
+            .iter()
+            .filter(|p| launch.browser.map_or(true, |sb| p.browser == sb))
+            .map(|p| p.memory_bytes)
+            .sum::<u64>() as f64
+            / (1024.0 * 1024.0);
+        let cpu_pct = processes
+            .iter()
+            .filter(|p| launch.browser.map_or(true, |sb| p.browser == sb))
+            .map(|p| p.cpu_usage)
+            .sum::<f32>();
         history.push(ram_mb, cpu_pct);
 
         cx.spawn(async move |this, cx| {
@@ -308,7 +330,7 @@ impl BrowserMonitorGui {
             sort_desc: true,
             paused: false,
             theme: launch.theme,
-            selected_browser: None,
+            selected_browser: launch.browser,
             role_filter: RoleFilter::All,
             log_filter: LogFilter::All,
             selected_pid: None,
@@ -331,13 +353,15 @@ impl BrowserMonitorGui {
 
     fn refresh_now(&mut self, cx: &mut Context<Self>) {
         let (processes, browsers, components, host) = self.collector.collect(SortBy::Memory);
-        let ram_mb = processes.iter().map(|p| p.memory_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
-        let cpu_pct = processes.iter().map(|p| p.cpu_usage).sum::<f32>();
-        self.history.push(ram_mb, cpu_pct);
         self.processes = processes;
         self.browsers = browsers;
         self.components = components;
         self.host = host;
+
+        let filtered = self.filtered_processes();
+        let ram_mb = filtered.iter().map(|p| p.memory_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
+        let cpu_pct = filtered.iter().map(|p| p.cpu_usage).sum::<f32>();
+        self.history.push(ram_mb, cpu_pct);
 
         if let Some(pid) = self.selected_pid {
             if !self.processes.iter().any(|p| p.pid == pid) {
@@ -509,8 +533,43 @@ impl BrowserMonitorGui {
         list
     }
 
+    fn filtered_processes(&self) -> Vec<&ProcessDetail> {
+        self.processes
+            .iter()
+            .filter(|p| self.selected_browser.map_or(true, |b| p.browser == b))
+            .collect()
+    }
+
+    fn filtered_components(&self) -> Vec<ComponentSummary> {
+        let mut by_role: BTreeMap<ComponentRole, ComponentSummary> = BTreeMap::new();
+        for p in self.filtered_processes() {
+            let entry = by_role.entry(p.role).or_insert(ComponentSummary {
+                role: p.role,
+                count: 0,
+                hidden_count: 0,
+                total_memory_bytes: 0,
+                total_virtual_memory_bytes: 0,
+                total_cpu: 0.0,
+            });
+            entry.count += 1;
+            if p.is_hidden {
+                entry.hidden_count += 1;
+            }
+            entry.total_memory_bytes += p.memory_bytes;
+            entry.total_virtual_memory_bytes += p.virtual_memory_bytes;
+            entry.total_cpu += p.cpu_usage;
+        }
+        let mut list: Vec<ComponentSummary> = by_role.into_values().collect();
+        list.sort_by(|a, b| b.total_memory_bytes.cmp(&a.total_memory_bytes));
+        list
+    }
+
     fn sorted_browsers(&self) -> Vec<&BrowserSummary> {
-        let mut list: Vec<&BrowserSummary> = self.browsers.iter().collect();
+        let mut list: Vec<&BrowserSummary> = self
+            .browsers
+            .iter()
+            .filter(|b| self.selected_browser.map_or(true, |sb| b.browser == sb))
+            .collect();
         list.sort_by(|a, b| {
             let ord = match self.sort_col {
                 GuiSortCol::Browser | GuiSortCol::Pid | GuiSortCol::Role | GuiSortCol::Uptime => {
@@ -545,12 +604,22 @@ impl BrowserMonitorGui {
         cx.notify();
     }
 
-    fn select_browser_and_open(&mut self, b: Option<BrowserKind>, cx: &mut Context<Self>) {
+    fn set_selected_browser(&mut self, b: Option<BrowserKind>, cx: &mut Context<Self>) {
         self.selected_browser = b;
         self.selected_pid = None;
         self.confirm_kill_pid = None;
         self.open_dropdown = OpenDropdown::None;
         self.status_notice = None;
+        self.history = HistoryBuffer::new(self.history_capacity);
+        let filtered = self.filtered_processes();
+        let ram_mb = filtered.iter().map(|p| p.memory_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
+        let cpu_pct = filtered.iter().map(|p| p.cpu_usage).sum::<f32>();
+        self.history.push(ram_mb, cpu_pct);
+        cx.notify();
+    }
+
+    fn select_browser_and_open(&mut self, b: Option<BrowserKind>, cx: &mut Context<Self>) {
+        self.set_selected_browser(b, cx);
         if b.is_some() {
             self.active_tab = ActiveTab::Processes;
         }
@@ -849,7 +918,7 @@ impl BrowserMonitorGui {
     }
 
     fn render_kpi_card(
-        title: &'static str,
+        title: impl Into<SharedString>,
         value: String,
         subtitle: String,
         accent: u32,
@@ -865,7 +934,7 @@ impl BrowserMonitorGui {
             .bg(rgb(p.bg_panel))
             .border_1()
             .border_color(rgb(p.border))
-            .child(div().text_xs().text_color(rgb(p.text_muted)).child(title))
+            .child(div().text_xs().text_color(rgb(p.text_muted)).child(title.into()))
             .child(
                 div()
                     .text_xl()
@@ -877,7 +946,7 @@ impl BrowserMonitorGui {
     }
 
     fn render_spark_chart(
-        title: &'static str,
+        title: impl Into<SharedString>,
         samples: &[f64],
         max_bars: usize,
         unit: &'static str,
@@ -941,7 +1010,7 @@ impl BrowserMonitorGui {
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(p.text_primary))
-                            .child(title),
+                            .child(title.into()),
                     )
                     .child(div().text_xs().text_color(rgb(p.text_muted)).child(summary)),
             )
@@ -949,7 +1018,7 @@ impl BrowserMonitorGui {
     }
 
     fn render_sidebar(&self, p: &ThemePalette, cx: &mut Context<Self>) -> impl IntoElement {
-        let total_mem: u64 = self.processes.iter().map(|pr| pr.memory_bytes).sum();
+        let filtered_proc_count = self.filtered_processes().len();
         let status_label = if self.paused {
             "PAUSED".to_string()
         } else {
@@ -973,7 +1042,7 @@ impl BrowserMonitorGui {
             let text_col = active_text_color(self.theme, active, p);
             let badge_text = match tab {
                 ActiveTab::Browsers => format!("{}", self.browsers.len()),
-                ActiveTab::Processes => format!("{}", self.processes.len()),
+                ActiveTab::Processes => format!("{filtered_proc_count}"),
                 ActiveTab::Transfer => format!("{}", self.scanned_tabs.len()),
                 ActiveTab::Logs => format!("{}", self.collector.log.entries.len()),
                 _ => String::new(),
@@ -1019,105 +1088,8 @@ impl BrowserMonitorGui {
             );
         }
 
-        let all_active = self.selected_browser.is_none();
-        let all_bg = if all_active { p.bg_button_active } else { p.bg_panel };
-        let all_text = active_text_color(self.theme, all_active, p);
-
-        let mut browser_list = div()
-            .id("sidebar-browsers")
-            .flex_1()
-            .min_h(px(0.0))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .px_2()
-            .child(
-                div()
-                    .id("sb-browser-all")
-                    .flex()
-                    .flex_row()
-                    .justify_between()
-                    .items_center()
-                    .px_2p5()
-                    .py_1()
-                    .rounded_md()
-                    .bg(rgb(all_bg))
-                    .text_xs()
-                    .font_weight(if all_active { FontWeight::BOLD } else { FontWeight::NORMAL })
-                    .text_color(rgb(all_text))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(rgb(hover_bg)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|app, _, _, cx| {
-                            app.select_browser_and_open(None, cx);
-                        }),
-                    )
-                    .child(format!("All ({})", self.processes.len()))
-                    .child(format_bytes(total_mem)),
-            );
-
-        for (idx, b) in self.browsers.iter().enumerate() {
-            let bk = b.browser;
-            let active = self.selected_browser == Some(bk);
-            let bg = if active { p.bg_button_active } else { p.bg_panel };
-            let dot_col = browser_color(bk, p);
-            let text_col = active_text_color(self.theme, active, p);
-            let muted_col = if active && self.theme == ThemeMode::Classic {
-                0xffffff
-            } else {
-                p.text_muted
-            };
-
-            let label = if b.hidden_count > 0 {
-                format!("{} ({} · H:{})", bk.short_name(), b.count, b.hidden_count)
-            } else {
-                format!("{} ({})", bk.short_name(), b.count)
-            };
-
-            browser_list = browser_list.child(
-                div()
-                    .id(("sb-browser", idx))
-                    .flex()
-                    .flex_row()
-                    .justify_between()
-                    .items_center()
-                    .px_2p5()
-                    .py_1()
-                    .rounded_md()
-                    .bg(rgb(bg))
-                    .text_xs()
-                    .text_color(rgb(text_col))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(rgb(hover_bg)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |app, _, _, cx| {
-                            app.select_browser_and_open(Some(bk), cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_1p5()
-                            .overflow_hidden()
-                            .child(div().size(px(8.0)).rounded_full().bg(rgb(dot_col)))
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(muted_col))
-                            .child(format_bytes(b.total_memory_bytes)),
-                    ),
-            );
-        }
-
         div()
-            .w(px(260.0))
+            .w(px(230.0))
             .h_full()
             .flex()
             .flex_col()
@@ -1183,23 +1155,7 @@ impl BrowserMonitorGui {
                     )
                     .child(nav_group),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .px_3()
-                            .text_xs()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(p.text_muted))
-                            .child("BROWSERS (Click to Filter)"),
-                    )
-                    .child(browser_list),
-            )
+            .child(div().flex_1())
             .child(
                 div()
                     .flex()
@@ -1257,13 +1213,138 @@ impl BrowserMonitorGui {
             )
     }
 
+    fn render_process_row(
+        &self,
+        id_prefix: &'static str,
+        proc_: &ProcessDetail,
+        idx: usize,
+        show_vsz: bool,
+        p: &ThemePalette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let hover_bg = p.border;
+        let pid_val = proc_.pid;
+        let detail = proc_
+            .site
+            .as_deref()
+            .map(|s| s.trim_start_matches("https://").trim_start_matches("http://"))
+            .unwrap_or(&proc_.name)
+            .to_string();
+
+        let is_sel = self.selected_pid == Some(pid_val);
+        let row_bg = if is_sel {
+            p.bg_button_active
+        } else if idx % 2 == 1 {
+            p.bg_row_alt
+        } else {
+            p.bg_panel
+        };
+        let text_col = active_text_color(self.theme, is_sel, p);
+        let muted_col = if is_sel && self.theme == ThemeMode::Classic {
+            0xffffff
+        } else {
+            p.text_muted
+        };
+
+        let mut row = div()
+            .id((id_prefix, pid_val as usize))
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_2()
+            .py_1p5()
+            .rounded_sm()
+            .bg(rgb(row_bg))
+            .text_xs()
+            .text_color(rgb(text_col))
+            .cursor_pointer()
+            .hover(move |s| s.bg(rgb(hover_bg)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |app, _, _, cx| {
+                    app.selected_pid = if app.selected_pid == Some(pid_val) {
+                        None
+                    } else {
+                        Some(pid_val)
+                    };
+                    app.confirm_kill_pid = None;
+                    app.status_notice = None;
+                    cx.notify();
+                }),
+            )
+            .child(div().w(px(64.0)).px_1().child(pid_val.to_string()))
+            .child(
+                div()
+                    .w(px(98.0))
+                    .px_1()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(if is_sel && self.theme == ThemeMode::Classic {
+                        0xffffff
+                    } else {
+                        browser_color(proc_.browser, p)
+                    }))
+                    .child(proc_.browser.short_name()),
+            )
+            .child(
+                div()
+                    .w(px(115.0))
+                    .px_1()
+                    .text_color(rgb(if is_sel && self.theme == ThemeMode::Classic {
+                        0xffffff
+                    } else {
+                        role_color(proc_.role, p)
+                    }))
+                    .child(proc_.role.short_name()),
+            )
+            .child(
+                div()
+                    .w(px(64.0))
+                    .px_1()
+                    .text_color(rgb(if proc_.is_hidden { p.accent_red } else { muted_col }))
+                    .child(if proc_.is_hidden { "Hidden" } else { "-" }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .px_1()
+                    .text_color(rgb(muted_col))
+                    .overflow_hidden()
+                    .child(detail),
+            )
+            .child(div().w(px(68.0)).px_1().child(format!("{:.1}%", proc_.cpu_usage)))
+            .child(
+                div()
+                    .w(px(90.0))
+                    .px_1()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(format_bytes(proc_.memory_bytes)),
+            );
+        if show_vsz {
+            row = row.child(
+                div()
+                    .w(px(88.0))
+                    .px_1()
+                    .text_color(rgb(muted_col))
+                    .child(format_bytes(proc_.virtual_memory_bytes)),
+            );
+        }
+        row.child(
+            div()
+                .w(px(76.0))
+                .px_1()
+                .text_color(rgb(muted_col))
+                .child(format_duration(proc_.run_time_secs)),
+        )
+    }
+
     fn render_overview(&self, p: &ThemePalette, cx: &mut Context<Self>) -> impl IntoElement {
-        let total_mem: u64 = self.processes.iter().map(|pr| pr.memory_bytes).sum();
-        let total_vsz: u64 = self.processes.iter().map(|pr| pr.virtual_memory_bytes).sum();
-        let total_cpu: f32 = self.processes.iter().map(|pr| pr.cpu_usage).sum();
-        let hidden_n = self.processes.iter().filter(|pr| pr.is_hidden).count();
-        let hidden_mem: u64 = self
-            .processes
+        let filtered_procs = self.filtered_processes();
+        let filtered_comps = self.filtered_components();
+        let total_mem: u64 = filtered_procs.iter().map(|pr| pr.memory_bytes).sum();
+        let total_vsz: u64 = filtered_procs.iter().map(|pr| pr.virtual_memory_bytes).sum();
+        let total_cpu: f32 = filtered_procs.iter().map(|pr| pr.cpu_usage).sum();
+        let hidden_n = filtered_procs.iter().filter(|pr| pr.is_hidden).count();
+        let hidden_mem: u64 = filtered_procs
             .iter()
             .filter(|pr| pr.is_hidden)
             .map(|pr| pr.memory_bytes)
@@ -1283,6 +1364,32 @@ impl BrowserMonitorGui {
         let cpu_samples: Vec<f64> = self.history.cpu_history.iter().map(|&v| v as f64).collect();
         let hover_bg = p.bg_row_alt;
 
+        let (ram_title, cpu_title, scope_label) = match self.selected_browser {
+            Some(bk) => (
+                format!("{} RAM", bk.short_name().to_uppercase()),
+                format!("{} CPU", bk.short_name().to_uppercase()),
+                bk.display_name().to_string(),
+            ),
+            None => (
+                "ALL BROWSERS RAM".to_string(),
+                "TOTAL BROWSER CPU".to_string(),
+                "All Browsers".to_string(),
+            ),
+        };
+        let hidden_sub = match self.selected_browser {
+            Some(bk) => format!(
+                "{} hidden in {} {} procs",
+                format_bytes(hidden_mem),
+                filtered_procs.len(),
+                bk.short_name()
+            ),
+            None => format!(
+                "{} hidden across {} procs",
+                format_bytes(hidden_mem),
+                filtered_procs.len()
+            ),
+        };
+
         let mut col = div()
             .flex()
             .flex_col()
@@ -1293,14 +1400,16 @@ impl BrowserMonitorGui {
                     .flex_row()
                     .gap_2p5()
                     .child(Self::render_kpi_card(
-                        "ALL BROWSERS RAM",
+                        ram_title,
                         format_bytes(total_mem),
                         format!("{:.1}% of host  |  VSZ {}", pct_host, format_bytes(total_vsz)),
-                        p.accent_cyan,
+                        self.selected_browser
+                            .map(|bk| browser_color(bk, p))
+                            .unwrap_or(p.accent_cyan),
                         p,
                     ))
                     .child(Self::render_kpi_card(
-                        "TOTAL BROWSER CPU",
+                        cpu_title,
                         format!("{:.1}%", total_cpu),
                         format!("{} host cores", self.host.cpu_count),
                         if total_cpu > 30.0 {
@@ -1313,7 +1422,7 @@ impl BrowserMonitorGui {
                     .child(Self::render_kpi_card(
                         "HIDDEN SERVICES",
                         format!("{hidden_n} bg"),
-                        format!("{} hidden across {} procs", format_bytes(hidden_mem), self.processes.len()),
+                        hidden_sub,
                         p.accent_red,
                         p,
                     ))
@@ -1357,7 +1466,7 @@ impl BrowserMonitorGui {
                             .gap_4()
                             .text_xs()
                             .text_color(rgb(p.text_muted))
-                            .child(format!("All Browsers: {}", format_bytes(total_mem)))
+                            .child(format!("{scope_label}: {}", format_bytes(total_mem)))
                             .child(format!("Other Apps: {}", format_bytes(other_used)))
                             .child(format!(
                                 "Free: {}",
@@ -1374,7 +1483,11 @@ impl BrowserMonitorGui {
                     .flex_row()
                     .gap_2p5()
                     .child(Self::render_spark_chart(
-                        "RAM TREND",
+                        if let Some(bk) = self.selected_browser {
+                            format!("{} RAM TREND", bk.short_name().to_uppercase())
+                        } else {
+                            "RAM TREND".to_string()
+                        },
                         &ram_samples,
                         self.history_capacity,
                         " MB",
@@ -1382,7 +1495,11 @@ impl BrowserMonitorGui {
                         p,
                     ))
                     .child(Self::render_spark_chart(
-                        "CPU TREND",
+                        if let Some(bk) = self.selected_browser {
+                            format!("{} CPU TREND", bk.short_name().to_uppercase())
+                        } else {
+                            "CPU TREND".to_string()
+                        },
                         &cpu_samples,
                         self.history_capacity,
                         "%",
@@ -1413,12 +1530,35 @@ impl BrowserMonitorGui {
                                 .text_xs()
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(rgb(p.text_primary))
-                                .child("BROWSER RAM BREAKDOWN (Click any browser to inspect processes)"),
+                                .child(match self.selected_browser {
+                                    Some(bk) => format!(
+                                        "{} SUMMARY ({} procs, {} hidden)",
+                                        bk.display_name().to_uppercase(),
+                                        filtered_procs.len(),
+                                        hidden_n
+                                    ),
+                                    None => {
+                                        "BROWSER RAM BREAKDOWN (Click any browser or use top dropdown to filter)"
+                                            .to_string()
+                                    }
+                                }),
                         )
                         .child(
                             div()
                                 .flex()
                                 .gap_1p5()
+                                .when(self.selected_browser.is_some(), |el| {
+                                    el.child(Self::render_button(
+                                        "ov-show-all-browsers",
+                                        "Show All Browsers",
+                                        false,
+                                        self.theme,
+                                        p,
+                                        cx.listener(|app, _, _, cx| {
+                                            app.set_selected_browser(None, cx);
+                                        }),
+                                    ))
+                                })
                                 .child(Self::render_button(
                                     "ov-transfer",
                                     "Transfer Tabs →",
@@ -1437,7 +1577,6 @@ impl BrowserMonitorGui {
                                     self.theme,
                                     p,
                                     cx.listener(|app, _, _, cx| {
-                                        app.selected_browser = None;
                                         app.role_filter = RoleFilter::HiddenOnly;
                                         app.active_tab = ActiveTab::Processes;
                                         cx.notify();
@@ -1446,81 +1585,92 @@ impl BrowserMonitorGui {
                         ),
                 );
 
-            for (idx, b) in self.browsers.iter().enumerate() {
-                let bk = b.browser;
-                let pct = if total_mem > 0 {
-                    (b.total_memory_bytes as f64 / total_mem as f64) * 100.0
-                } else {
-                    0.0
-                };
-                let bar_frac = (pct / 100.0).clamp(0.01, 1.0) as f32;
-                let col_b = browser_color(bk, p);
-                let meta = if !b.has_main_ui {
-                    format!("{} hidden bg · {:.1}% CPU", b.count, b.total_cpu)
-                } else if b.hidden_count > 0 {
-                    format!("{} procs ({} hidden) · {:.1}% CPU", b.count, b.hidden_count, b.total_cpu)
-                } else {
-                    format!("{} procs · {:.1}% CPU", b.count, b.total_cpu)
-                };
-
+            let shown_browsers: Vec<&BrowserSummary> = self.sorted_browsers();
+            if shown_browsers.is_empty() {
                 browser_bars = browser_bars.child(
                     div()
-                        .id(("ov-bbar", idx))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_3()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(move |s| s.bg(rgb(hover_bg)))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |app, _, _, cx| {
-                                app.role_filter = RoleFilter::All;
-                                app.select_browser_and_open(Some(bk), cx);
-                            }),
-                        )
-                        .child(
-                            div()
-                                .w(px(165.0))
-                                .text_xs()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(col_b))
-                                .child(bk.display_name()),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .h(px(11.0))
-                                .rounded_sm()
-                                .bg(rgb(p.bg_app))
-                                .overflow_hidden()
-                                .flex()
-                                .child(div().w(relative(bar_frac)).h_full().bg(rgb(col_b))),
-                        )
-                        .child(
-                            div()
-                                .w(px(115.0))
-                                .text_xs()
-                                .text_color(rgb(p.text_primary))
-                                .child(format!("{} ({:.1}%)", format_bytes(b.total_memory_bytes), pct)),
-                        )
-                        .child(
-                            div()
-                                .w(px(210.0))
-                                .text_xs()
-                                .text_color(rgb(p.text_muted))
-                                .overflow_hidden()
-                                .child(meta),
-                        ),
+                        .p_2()
+                        .text_xs()
+                        .text_color(rgb(p.accent_amber))
+                        .child(format!("No running processes detected for {scope_label}.")),
                 );
+            } else {
+                for (idx, b) in shown_browsers.into_iter().enumerate() {
+                    let bk = b.browser;
+                    let pct = if total_mem > 0 {
+                        (b.total_memory_bytes as f64 / total_mem as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    let bar_frac = (pct / 100.0).clamp(0.01, 1.0) as f32;
+                    let col_b = browser_color(bk, p);
+                    let meta = if !b.has_main_ui {
+                        format!("{} hidden bg · {:.1}% CPU", b.count, b.total_cpu)
+                    } else if b.hidden_count > 0 {
+                        format!("{} procs ({} hidden) · {:.1}% CPU", b.count, b.hidden_count, b.total_cpu)
+                    } else {
+                        format!("{} procs · {:.1}% CPU", b.count, b.total_cpu)
+                    };
+
+                    browser_bars = browser_bars.child(
+                        div()
+                            .id(("ov-bbar", idx))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_3()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(rgb(hover_bg)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |app, _, _, cx| {
+                                    app.set_selected_browser(Some(bk), cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .w(px(165.0))
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(col_b))
+                                    .child(bk.display_name()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .h(px(11.0))
+                                    .rounded_sm()
+                                    .bg(rgb(p.bg_app))
+                                    .overflow_hidden()
+                                    .flex()
+                                    .child(div().w(relative(bar_frac)).h_full().bg(rgb(col_b))),
+                            )
+                            .child(
+                                div()
+                                    .w(px(115.0))
+                                    .text_xs()
+                                    .text_color(rgb(p.text_primary))
+                                    .child(format!("{} ({:.1}%)", format_bytes(b.total_memory_bytes), pct)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(210.0))
+                                    .text_xs()
+                                    .text_color(rgb(p.text_muted))
+                                    .overflow_hidden()
+                                    .child(meta),
+                            ),
+                    );
+                }
             }
             col = col.child(browser_bars);
         }
 
-        let mut role_panel = div()
+        // 1. Expanded ALL COMPONENTS BREAKDOWN (visible by default)
+        let mut comp_panel = div()
             .flex()
             .flex_col()
             .gap_1p5()
@@ -1531,56 +1681,217 @@ impl BrowserMonitorGui {
             .border_color(rgb(p.border))
             .child(
                 div()
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(p.text_primary))
-                    .child("COMPONENT ROLES ACROSS ALL BROWSERS (Click to Filter Processes)"),
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .pb_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(p.text_primary))
+                            .child(format!(
+                                "ALL COMPONENTS BREAKDOWN — {} ({} roles across {} procs)",
+                                scope_label.to_uppercase(),
+                                filtered_comps.len(),
+                                filtered_procs.len()
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(p.text_muted))
+                            .child("Click any component row to filter Processes"),
+                    ),
             );
 
-        let mut role_pills = div().flex().flex_row().flex_wrap().gap_2();
-        for (idx, comp) in self.components.iter().enumerate() {
-            let role = comp.role;
-            let rc = role_color(role, p);
-            role_pills = role_pills.child(
+        if filtered_comps.is_empty() {
+            comp_panel = comp_panel.child(
                 div()
-                    .id(("ov-role", idx))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2p5()
-                    .py_1p5()
-                    .rounded_md()
-                    .bg(rgb(p.bg_button))
-                    .border_1()
-                    .border_color(rgb(p.border_strong))
+                    .p_2()
                     .text_xs()
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(rgb(hover_bg)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |app, _, _, cx| {
-                            app.role_filter = RoleFilter::Role(role);
+                    .text_color(rgb(p.accent_amber))
+                    .child("No active components for this selection."),
+            );
+        } else {
+            for (idx, comp) in filtered_comps.iter().enumerate() {
+                let role = comp.role;
+                let rc = role_color(role, p);
+                let pct = if total_mem > 0 {
+                    (comp.total_memory_bytes as f64 / total_mem as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let bar_frac = (pct / 100.0).clamp(0.01, 1.0) as f32;
+                let proc_info = if comp.hidden_count > 0 {
+                    format!(
+                        "{} procs ({} hidden) · {:.1}% CPU · VSZ {}",
+                        comp.count,
+                        comp.hidden_count,
+                        comp.total_cpu,
+                        format_bytes(comp.total_virtual_memory_bytes)
+                    )
+                } else {
+                    format!(
+                        "{} procs · {:.1}% CPU · VSZ {}",
+                        comp.count,
+                        comp.total_cpu,
+                        format_bytes(comp.total_virtual_memory_bytes)
+                    )
+                };
+
+                comp_panel = comp_panel.child(
+                    div()
+                        .id(("ov-comp-row", idx))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2p5()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(hover_bg)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app, _, _, cx| {
+                                app.role_filter = RoleFilter::Role(role);
+                                app.active_tab = ActiveTab::Processes;
+                                cx.notify();
+                            }),
+                        )
+                        .child(div().size(px(8.0)).rounded_full().bg(rgb(rc)))
+                        .child(
+                            div()
+                                .w(px(165.0))
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(rc))
+                                .child(role.display_name()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .h(px(10.0))
+                                .rounded_sm()
+                                .bg(rgb(p.bg_app))
+                                .overflow_hidden()
+                                .flex()
+                                .child(div().w(relative(bar_frac)).h_full().bg(rgb(rc))),
+                        )
+                        .child(
+                            div()
+                                .w(px(115.0))
+                                .text_xs()
+                                .text_color(rgb(p.text_primary))
+                                .child(format!("{} ({:.1}%)", format_bytes(comp.total_memory_bytes), pct)),
+                        )
+                        .child(
+                            div()
+                                .w(px(235.0))
+                                .text_xs()
+                                .text_color(rgb(p.text_muted))
+                                .overflow_hidden()
+                                .child(proc_info),
+                        ),
+                );
+            }
+        }
+        col = col.child(comp_panel);
+
+        // 2. Expanded ACTIVE & HIDDEN COMPONENT PROCESSES directly on Overview (visible by default)
+        let mut sorted_ov_procs = filtered_procs;
+        sorted_ov_procs.sort_by(|a, b| {
+            let ord = match self.sort_col {
+                GuiSortCol::Pid => a.pid.cmp(&b.pid),
+                GuiSortCol::Browser => a.browser.short_name().cmp(b.browser.short_name()),
+                GuiSortCol::Role => a.role.short_name().cmp(b.role.short_name()),
+                GuiSortCol::Hidden => a.is_hidden.cmp(&b.is_hidden),
+                GuiSortCol::Cpu => a
+                    .cpu_usage
+                    .partial_cmp(&b.cpu_usage)
+                    .unwrap_or(Ordering::Equal),
+                GuiSortCol::Ram | GuiSortCol::Procs => a.memory_bytes.cmp(&b.memory_bytes),
+                GuiSortCol::Vsz => a.virtual_memory_bytes.cmp(&b.virtual_memory_bytes),
+                GuiSortCol::Uptime => a.run_time_secs.cmp(&b.run_time_secs),
+            };
+            if self.sort_desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+
+        let proc_hdr = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(rgb(p.border_strong))
+            .child(self.render_sort_header("ovhdr-pid", "PID", GuiSortCol::Pid, Some(64.0), p, cx))
+            .child(self.render_sort_header("ovhdr-br", "Browser", GuiSortCol::Browser, Some(98.0), p, cx))
+            .child(self.render_sort_header("ovhdr-role", "Role", GuiSortCol::Role, Some(115.0), p, cx))
+            .child(self.render_sort_header("ovhdr-hid", "Hidden", GuiSortCol::Hidden, Some(64.0), p, cx))
+            .child(div().flex_1().px_1().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(p.text_muted)).child("Site / Process Name"))
+            .child(self.render_sort_header("ovhdr-cpu", "CPU%", GuiSortCol::Cpu, Some(68.0), p, cx))
+            .child(self.render_sort_header("ovhdr-ram", "RAM", GuiSortCol::Ram, Some(90.0), p, cx))
+            .child(self.render_sort_header("ovhdr-up", "Uptime", GuiSortCol::Uptime, Some(76.0), p, cx));
+
+        let mut proc_panel = div()
+            .flex()
+            .flex_col()
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(p.bg_panel))
+            .border_1()
+            .border_color(rgb(p.border))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .pb_1p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(p.text_primary))
+                            .child(format!(
+                                "ACTIVE & HIDDEN COMPONENT PROCESSES — {} ({} shown)",
+                                scope_label.to_uppercase(),
+                                sorted_ov_procs.len()
+                            )),
+                    )
+                    .child(Self::render_button(
+                        "ov-open-procs-tab",
+                        "Full Filter View →",
+                        false,
+                        self.theme,
+                        p,
+                        cx.listener(|app, _, _, cx| {
                             app.active_tab = ActiveTab::Processes;
                             cx.notify();
                         }),
-                    )
-                    .child(div().size(px(8.0)).rounded_full().bg(rgb(rc)))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(p.text_primary))
-                            .child(format!("{} ({})", role.short_name(), comp.count)),
-                    )
-                    .child(
-                        div()
-                            .text_color(rgb(p.text_muted))
-                            .child(format_bytes(comp.total_memory_bytes)),
-                    ),
+                    )),
+            )
+            .child(proc_hdr);
+
+        if sorted_ov_procs.is_empty() {
+            proc_panel = proc_panel.child(
+                div()
+                    .p_3()
+                    .text_xs()
+                    .text_color(rgb(p.accent_amber))
+                    .child("No active browser processes matching selection."),
             );
+        } else {
+            for (idx, proc_) in sorted_ov_procs.into_iter().enumerate() {
+                proc_panel = proc_panel.child(self.render_process_row("ov-proc", proc_, idx, false, p, cx));
+            }
         }
-        role_panel = role_panel.child(role_pills);
-        col = col.child(role_panel);
+        col = col.child(proc_panel);
 
         col
     }
@@ -1705,7 +2016,6 @@ impl BrowserMonitorGui {
 
     fn render_processes_tab(&self, p: &ThemePalette, cx: &mut Context<Self>) -> impl IntoElement {
         let procs = self.sorted_processes();
-        let hover_bg = p.border;
 
         let role_bar = div()
             .flex()
@@ -1803,113 +2113,7 @@ impl BrowserMonitorGui {
             );
         } else {
             for (idx, proc_) in procs.into_iter().enumerate() {
-                let pid_val = proc_.pid;
-                let detail = proc_
-                    .site
-                    .as_deref()
-                    .map(|s| s.trim_start_matches("https://").trim_start_matches("http://"))
-                    .unwrap_or(&proc_.name)
-                    .to_string();
-
-                let is_sel = self.selected_pid == Some(pid_val);
-                let row_bg = if is_sel {
-                    p.bg_button_active
-                } else if idx % 2 == 1 {
-                    p.bg_row_alt
-                } else {
-                    p.bg_panel
-                };
-                let text_col = active_text_color(self.theme, is_sel, p);
-                let muted_col = if is_sel && self.theme == ThemeMode::Classic {
-                    0xffffff
-                } else {
-                    p.text_muted
-                };
-
-                let mut row = div()
-                    .id(("proc-row", pid_val as usize))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .px_2()
-                    .py_1p5()
-                    .rounded_sm()
-                    .bg(rgb(row_bg))
-                    .text_xs()
-                    .text_color(rgb(text_col))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(rgb(hover_bg)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |app, _, _, cx| {
-                            app.selected_pid = if app.selected_pid == Some(pid_val) {
-                                None
-                            } else {
-                                Some(pid_val)
-                            };
-                            app.confirm_kill_pid = None;
-                            app.status_notice = None;
-                            cx.notify();
-                        }),
-                    )
-                    .child(div().w(px(64.0)).px_1().child(pid_val.to_string()))
-                    .child(
-                        div()
-                            .w(px(98.0))
-                            .px_1()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(if is_sel && self.theme == ThemeMode::Classic {
-                                0xffffff
-                            } else {
-                                browser_color(proc_.browser, p)
-                            }))
-                            .child(proc_.browser.short_name()),
-                    )
-                    .child(
-                        div()
-                            .w(px(115.0))
-                            .px_1()
-                            .text_color(rgb(if is_sel && self.theme == ThemeMode::Classic {
-                                0xffffff
-                            } else {
-                                role_color(proc_.role, p)
-                            }))
-                            .child(proc_.role.short_name()),
-                    )
-                    .child(
-                        div()
-                            .w(px(64.0))
-                            .px_1()
-                            .text_color(rgb(if proc_.is_hidden { p.accent_red } else { muted_col }))
-                            .child(if proc_.is_hidden { "Hidden" } else { "-" }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .px_1()
-                            .text_color(rgb(muted_col))
-                            .overflow_hidden()
-                            .child(detail),
-                    )
-                    .child(div().w(px(68.0)).px_1().child(format!("{:.1}%", proc_.cpu_usage)))
-                    .child(div().w(px(90.0)).px_1().font_weight(FontWeight::MEDIUM).child(format_bytes(proc_.memory_bytes)));
-                if self.show_vsz {
-                    row = row.child(
-                        div()
-                            .w(px(88.0))
-                            .px_1()
-                            .text_color(rgb(muted_col))
-                            .child(format_bytes(proc_.virtual_memory_bytes)),
-                    );
-                }
-                row = row.child(
-                    div()
-                        .w(px(76.0))
-                        .px_1()
-                        .text_color(rgb(muted_col))
-                        .child(format_duration(proc_.run_time_secs)),
-                );
-                table = table.child(row);
+                table = table.child(self.render_process_row("proc-row", proc_, idx, self.show_vsz, p, cx));
             }
         }
         table
@@ -2304,6 +2508,7 @@ impl BrowserMonitorGui {
             .entries
             .iter()
             .rev()
+            .filter(|e| self.selected_browser.map_or(true, |sb| e.browser == sb))
             .filter(|e| match self.log_filter {
                 LogFilter::All => true,
                 LogFilter::SpawnsExits => matches!(e.level, LogLevel::Spawn | LogLevel::Exit),
@@ -2978,12 +3183,15 @@ impl Render for BrowserMonitorGui {
         let p = ThemePalette::for_mode(self.theme);
 
         let page_title = match self.active_tab {
-            ActiveTab::Overview => "All Browsers Overview",
-            ActiveTab::Browsers => "Browsers Summary",
-            ActiveTab::Processes => "Process & Hidden Service Manager",
-            ActiveTab::Transfer => "Cross-Browser Tab Transfer",
-            ActiveTab::Logs => "Activity & Event Logs",
-            ActiveTab::Settings => "Settings & Browser Install Paths",
+            ActiveTab::Overview => match self.selected_browser {
+                Some(bk) => format!("{} Overview", bk.display_name()),
+                None => "All Browsers Overview".to_string(),
+            },
+            ActiveTab::Browsers => "Browsers Summary".to_string(),
+            ActiveTab::Processes => "Process & Hidden Service Manager".to_string(),
+            ActiveTab::Transfer => "Cross-Browser Tab Transfer".to_string(),
+            ActiveTab::Logs => "Activity & Event Logs".to_string(),
+            ActiveTab::Settings => "Settings & Browser Install Paths".to_string(),
         };
 
         let mut toolbar = div()
@@ -3033,7 +3241,7 @@ impl Render for BrowserMonitorGui {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|app, _, _, cx| {
-                                                app.select_browser_and_open(None, cx);
+                                                app.set_selected_browser(None, cx);
                                             }),
                                         )
                                         .child("✕"),
@@ -3152,11 +3360,7 @@ impl Render for BrowserMonitorGui {
                 280.0,
                 &p,
                 |app, opt_bk, cx| {
-                    app.selected_browser = opt_bk;
-                    app.selected_pid = None;
-                    app.confirm_kill_pid = None;
-                    app.open_dropdown = OpenDropdown::None;
-                    cx.notify();
+                    app.set_selected_browser(opt_bk, cx);
                 },
                 cx,
             );
